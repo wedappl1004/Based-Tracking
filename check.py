@@ -1,0 +1,836 @@
+"""
+check.py — BASED 감시 1회 실행 (GitHub Actions가 15분마다 자동 실행)
+OKX(캔들/펀딩/OI) + Hyperliquid + DexScreener → 신호 감지 → 텔레그램 전송
+의존성: requests 하나뿐
+"""
+import json
+import os
+import time
+import requests
+
+COIN = "BASED"
+OKX = "https://www.okx.com"
+SUPPORT_LEVEL = 0.075   # 박스 하단 (차트 바뀌면 수정)
+STOP_LEVEL = 0.06       # 손절선
+REALERT_HOURS = 6       # 같은 신호 재알림 간격
+STATE_FILE = "state.json"
+
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# 코인글래스 (선택) — 있으면 집계 OI/펀딩/청산/진짜 CVD로 업그레이드
+COINGLASS_KEY = os.environ.get("COINGLASS_API_KEY", "")
+CG = "https://open-api-v4.coinglass.com"
+
+# 고래 추적 (선택) — Etherscan V2 키 하나로 BNB체인 조회
+ETHERSCAN_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
+# 쉼표로 여러 개 가능. 기본 체인은 BNB(56), 다른 체인이면 "체인ID:주소" 형식
+# 예: "0xAAA...,0xBBB...,1:0xCCC..."  (1=이더리움, 56=BNB, 8453=Base)
+BASED_CONTRACT = os.environ.get("BASED_CONTRACT", "")
+
+import re
+
+def parse_contracts():
+    """쉼표/줄바꿈/공백/붙여쓰기 전부 허용. "체인ID:0x..." 형식이면 체인 고정,
+    아니면 None으로 두고 실행 시 DexScreener로 자동 판별."""
+    out, used = [], set()
+    for m in re.finditer(r"(?:(\d+)\s*:\s*)?(0x[a-fA-F0-9]{40})", BASED_CONTRACT):
+        chain, addr = m.group(1), m.group(2).lower()
+        if addr not in used:
+            used.add(addr)
+            out.append((chain, addr))
+    return out
+
+CONTRACTS = parse_contracts()
+
+# DexScreener 체인 이름 → Etherscan V2 체인 ID
+CHAIN_IDS = {"bsc": "56", "ethereum": "1", "base": "8453",
+             "arbitrum": "42161", "polygon": "137", "optimism": "10",
+             "avalanche": "43114", "hyperevm": "999", "linea": "59144",
+             "scroll": "534352", "blast": "81457", "sonic": "146"}
+WHALE_THRESHOLD = 100_000  # 이 수량 이상 이동 시 고래로 간주
+
+# ── 관찰 지갑 (워치리스트) ────────────────────────────
+# 이 지갑들은 금액 무관, 움직이면 무조건 알림. DEX 매도는 최상급 경보.
+# 추가/삭제: 아래 목록 수정 or 시크릿 WATCH_WALLETS에 "주소=라벨,주소" 형식으로
+WATCHLIST = {
+    "0xfd09a9cc989cd9d7ff0a1cab6af28c677267a2b9": "지갑#1",
+    "0x82bf8528979e64a0b9467caf4a2f0a37aae7e44d": "고점 판매자",
+    "0x36420bbdb37db0aa8e999855d41642ba13f18334": "0x3642",
+    "0xf4767bf23d8a7d24aeac0a8c3993e1519b42698b": "0xf476",
+    "0x2c2b2ab6dce8db3fe75f330d8a6da94b1d11f8c5": "0x2c2b",
+    "0xedd0a6c1889be3a05aba0c3abfb80f409909b7e6": "0xedd0",
+    "0x78b8aecf9b138bb409a51d3111f2db7dc57ddda0": "0x78b8",
+    "0xbd47565f3b67e81968f39ad034d340da54c32e5b": "0xbd47",
+    "0xe584349166881881651f350265c3190632d60c29": "0xe584",
+    "0xb055c5f69c7250cf5dc6ccb5cfd72a55dd8c662e": "0xb055",
+    "0x7142e1a36e6f41d30f9b1dd5dd82014d0be184f7": "0x7142",
+    "0x6196cbf7b0c0cd3f620dbbc8c1e36992d795c223": "0x6196",
+    "0x16f187b493b2f4380dcb2ec156df6f7fa46cd2e4": "0x16f1",
+    "0x24761589719dfd062ffdde6f046cbdd96ca1fd95": "0x2476",
+    "0xc9f2335bc08f1e908b2b5340921c3eec983d9245": "0xc9f2",
+    "0x300b88fe6350dba2513206b4cf15b9eb2c9c4a90": "0x300b",
+    "0x42a99d7dc78415ea0995edd8d5e718495a07a7c1": "0x42a9",
+    "0x6908518e91b83a05a51b8961d1c5667b2e9bc4a3": "0x6908",
+    "0x738a2c8dd840831b9bb9e4103c68d98c41e20abe": "Liquid_Token_Fund_2",
+    "0x3279890e9d96de71712b1dfb09adafb4c4d9e831": "0x3279",
+    "0x1edbb05b8436c3244e83c39f963be43c75272e21": "0x1edb",
+    "0xe3cfddf45caeaa853332de5257f59ba0d9a112c1": "0xe3cf",
+}
+for _item in os.environ.get("WATCH_WALLETS", "").split(","):
+    _item = _item.strip()
+    if _item.startswith("0x"):
+        _a, _, _l = _item.partition("=")
+        WATCHLIST[_a.strip().lower()] = _l.strip() or _a[:8]
+WATCH_MIN = 1_000   # 워치리스트 알림 최소 수량 (더스트 스팸 방지)
+# True = 온체인 알림은 내 워치리스트 지갑만 (조용함)
+# False = 모든 지갑의 수상한 움직임도 알림 (매집/고래/쪼개기 등)
+WATCH_ONLY = True
+
+
+
+# ── 데이터 수집 ──────────────────────────────────────
+def get(url, **kw):
+    r = requests.get(url, timeout=15, **kw)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_candles():
+    for inst in (f"{COIN}-USDT-SWAP", f"{COIN}-USDT"):
+        try:
+            d = get(f"{OKX}/api/v5/market/candles",
+                    params={"instId": inst, "bar": "15m", "limit": "300"})
+            rows = d.get("data") or []
+            if rows:
+                rows.reverse()
+                return [{"o": float(r[1]), "h": float(r[2]), "l": float(r[3]),
+                         "c": float(r[4]), "v": float(r[5])} for r in rows]
+        except Exception as e:
+            print(f"[candles {inst}] {e}")
+    raise RuntimeError("캔들 수신 실패")
+
+
+def fetch_funding():
+    try:
+        d = get(f"{OKX}/api/v5/public/funding-rate",
+                params={"instId": f"{COIN}-USDT-SWAP"})
+        return float(d["data"][0]["fundingRate"])
+    except Exception:
+        return None
+
+
+def fetch_oi():
+    try:
+        d = get(f"{OKX}/api/v5/public/open-interest",
+                params={"instId": f"{COIN}-USDT-SWAP"})
+        row = d["data"][0]
+        return float(row.get("oiUsd") or 0) or float(row.get("oiCcy") or 0)
+    except Exception:
+        return None
+
+
+def fetch_hl():
+    try:
+        r = requests.post("https://api.hyperliquid.xyz/info",
+                          json={"type": "metaAndAssetCtxs"}, timeout=15)
+        meta, ctxs = r.json()
+        for i, u in enumerate(meta["universe"]):
+            if u["name"].upper() == COIN:
+                c = ctxs[i]
+                return {"funding": float(c["funding"]), "oi": float(c["openInterest"])}
+    except Exception as e:
+        print(f"[HL] {e}")
+    return None
+
+
+def fetch_dex_liquidity():
+    try:
+        d = get("https://api.dexscreener.com/latest/dex/search", params={"q": COIN})
+        pairs = [p for p in d.get("pairs") or []
+                 if (p.get("baseToken") or {}).get("symbol", "").upper() == COIN]
+        if pairs:
+            p = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd") or 0)
+            return {"liq": (p.get("liquidity") or {}).get("usd"),
+                    "pair": (p.get("pairAddress") or "").lower()}
+    except Exception as e:
+        print(f"[dex] {e}")
+    return None
+
+
+def cg(path, **params):
+    """코인글래스 V4 호출. 키 없거나 플랜 미지원이면 None (자동 폴백)"""
+    if not COINGLASS_KEY:
+        return None
+    try:
+        r = requests.get(CG + path, params=params, timeout=15,
+                         headers={"CG-API-KEY": COINGLASS_KEY,
+                                  "Accept": "application/json"})
+        d = r.json()
+        if str(d.get("code")) != "0":
+            print(f"[CG {path}] {d.get('msg')}")
+            return None
+        return d.get("data")
+    except Exception as e:
+        print(f"[CG {path}] {e}")
+        return None
+
+
+def fetch_cg_bundle():
+    """집계 OI + 가중 펀딩 + 청산 + 테이커 델타 (가능한 것만)"""
+    out = {}
+    oi = cg("/api/futures/openInterest/aggregated-history",
+            symbol=COIN, interval="1h", limit=48)
+    if oi:
+        closes = [float(x.get("close") or x.get("c") or 0) for x in oi]
+        if len(closes) >= 2 and closes[0]:
+            out["oi_now"] = closes[-1]
+            out["oi_chg_24h"] = (closes[-1] / closes[max(0, len(closes)-24)] - 1) * 100
+
+    fr = cg("/api/futures/fundingRate/oi-weight-ohlc-history",
+            symbol=COIN, interval="8h", limit=6)
+    if fr:
+        out["funding_w"] = float(fr[-1].get("close") or fr[-1].get("c") or 0)
+
+    liq = cg("/api/futures/liquidation/aggregated-history",
+             symbol=COIN, interval="1h", limit=24)
+    if liq:
+        longs = [float(x.get("longLiquidationUsd") or x.get("long_liquidation_usd") or 0) for x in liq]
+        shorts = [float(x.get("shortLiquidationUsd") or x.get("short_liquidation_usd") or 0) for x in liq]
+        out["liq_long_now"], out["liq_short_now"] = longs[-1], shorts[-1]
+        out["liq_long_avg"] = avg(longs[:-1]) or 1e-9
+        out["liq_short_avg"] = avg(shorts[:-1]) or 1e-9
+
+    fv = cg("/api/futures/aggregated-volume/history", symbol=COIN,
+            interval="1h", limit=24)
+    if fv:
+        vals = [float(x.get("volumeUsd") or x.get("volume_usd") or x.get("v") or 0) for x in fv]
+        out["fut_vol_24h"] = sum(vals)
+    sv = cg("/api/spot/aggregated-taker-buy-sell-volume/history", symbol=COIN,
+            interval="1h", limit=24)
+    if sv:
+        buys = [float(x.get("buy") or x.get("takerBuyVolumeUsd") or 0) for x in sv]
+        sells = [float(x.get("sell") or x.get("takerSellVolumeUsd") or 0) for x in sv]
+        out["spot_vol_24h"] = sum(buys) + sum(sells)
+        out["spot_delta_24h"] = sum(buys) - sum(sells)
+
+    gls = cg("/api/futures/global-long-short-account-ratio/history",
+             symbol=COIN, interval="1h", limit=4, exchange="OKX")
+    if gls:
+        out["ls_global"] = float(gls[-1].get("longShortRatio")
+                                 or gls[-1].get("long_short_ratio") or 0)
+    tls = cg("/api/futures/top-long-short-position-ratio/history",
+             symbol=COIN, interval="1h", limit=4, exchange="OKX")
+    if tls:
+        out["ls_top"] = float(tls[-1].get("longShortRatio")
+                              or tls[-1].get("long_short_ratio") or 0)
+
+    tk = cg("/api/futures/aggregated-taker-buy-sell-volume/history",
+            symbol=COIN, interval="1h", limit=36)
+    if tk:
+        deltas = [float(x.get("buy") or x.get("takerBuyVolumeUsd") or 0)
+                  - float(x.get("sell") or x.get("takerSellVolumeUsd") or 0) for x in tk]
+        out["taker_d10"], out["taker_d30"] = avg(deltas[-10:]), avg(deltas[-30:])
+    return out
+
+
+def fetch_transfers(chainid, contract, start_block):
+    """start_block 이후의 해당 토큰 전송 (최대 500건)"""
+    if not ETHERSCAN_KEY:
+        return []
+    try:
+        d = get("https://api.etherscan.io/v2/api", params={
+            "chainid": chainid, "module": "account", "action": "tokentx",
+            "contractaddress": contract,
+            "startblock": str(start_block), "endblock": "latest",
+            "page": "1", "offset": "500", "sort": "asc",
+            "apikey": ETHERSCAN_KEY})
+        txs = d.get("result") or []
+        if isinstance(txs, str):
+            print(f"[chain] API: {txs}")
+            return []
+        out = []
+        for tx in txs:
+            dec = int(tx.get("tokenDecimal") or 18)
+            out.append({"hash": tx["hash"], "block": int(tx["blockNumber"]),
+                        "from": tx["from"].lower(), "to": tx["to"].lower(),
+                        "amount": int(tx["value"]) / (10 ** dec),
+                        "symbol": tx.get("tokenSymbol", "")})
+        return out
+    except Exception as e:
+        print(f"[chain] {e}")
+        return []
+
+
+def fetch_deployer(chainid, contract):
+    """컨트랙트 배포자(팀 추정) 주소 — 최초 1회만 조회"""
+    try:
+        d = get("https://api.etherscan.io/v2/api", params={
+            "chainid": chainid, "module": "contract",
+            "action": "getcontractcreation",
+            "contractaddresses": contract,
+            "apikey": ETHERSCAN_KEY})
+        r = d.get("result")
+        if isinstance(r, list) and r:
+            return r[0].get("contractCreator", "").lower()
+    except Exception as e:
+        print(f"[deployer] {e}")
+    return ""
+
+
+def fetch_pair_for(contract):
+    """토큰 주소로 최대 유동성 페어 + 심볼 + 체인 자동 판별"""
+    try:
+        d = get(f"https://api.dexscreener.com/latest/dex/tokens/{contract}")
+        pairs = d.get("pairs") or []
+        if pairs:
+            p = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd") or 0)
+            return ((p.get("pairAddress") or "").lower(),
+                    (p.get("baseToken") or {}).get("symbol", ""),
+                    (p.get("chainId") or "").lower())
+    except Exception as e:
+        print(f"[pair {contract[:8]}] {e}")
+    return "", "", ""
+
+
+def analyze_chain(txs, chain_state, pair_addr=""):
+    """러그/덤핑 플레이북 대응 탐지기.
+    핵심 관점: 던지는 쪽은 탐지를 피하려고 쪼개고, 경유시키고, 새 지갑을 쓴다.
+    chain_state: {ledger, recv_count, deployer, seen_wallets, team}"""
+    alerts = []
+    ledger = chain_state.setdefault("ledger", {})
+    recv_count = chain_state.setdefault("recv_count", {})
+    seen = set(chain_state.setdefault("seen_wallets", []))
+    team = set(chain_state.setdefault("team", []))       # 팀 클러스터 (전염 추적)
+    deployer = chain_state.get("deployer", "")
+    if deployer:
+        team.add(deployer)
+    short = lambda a: a[:8] + "…"
+
+    def looks_exchange(addr):
+        return len(recv_count.get(addr, [])) >= 20
+
+    by_sender, by_recipient, by_pairkey = {}, {}, {}
+    received_now, sent_now = {}, {}
+    pair_inflow_total = 0.0
+    pair_inflow_team = 0.0
+
+    for tx in txs:
+        f, t, amt = tx["from"], tx["to"], tx["amount"]
+        ledger[f] = ledger.get(f, 0) - amt
+        ledger[t] = ledger.get(t, 0) + amt
+        senders = recv_count.setdefault(t, [])
+        if f not in senders:
+            senders.append(f); recv_count[t] = senders[-30:]
+        by_sender.setdefault(f, []).append(tx)
+        by_recipient.setdefault(t, []).append(tx)
+        by_pairkey.setdefault((f, t), []).append(amt)
+        received_now[t] = received_now.get(t, 0) + amt
+        sent_now[f] = sent_now.get(f, 0) + amt
+
+        # ── 매집 추적: 페어에서 받음 = DEX 매수 ──
+        acc = chain_state.setdefault("accum", {})
+        if pair_addr and f == pair_addr and t != pair_addr:
+            rec = acc.setdefault(t, {"buy_amt": 0, "buy_n": 0,
+                                     "in_amt": 0, "in_n": 0, "alerted": 0})
+            rec["buy_amt"] += amt
+            rec["buy_n"] += 1
+        elif t != pair_addr and f != pair_addr and amt >= WATCH_MIN:
+            rec = acc.setdefault(t, {"buy_amt": 0, "buy_n": 0,
+                                     "in_amt": 0, "in_n": 0, "alerted": 0})
+            rec["in_amt"] += amt
+            rec["in_n"] += 1
+
+        # ── 관찰 지갑: 움직임 무조건 보고 ──
+        if amt >= WATCH_MIN:
+            if f in WATCHLIST:
+                lbl = WATCHLIST[f]
+                if pair_addr and t == pair_addr:
+                    alerts.append(f"🚨👁 관찰지갑 [{lbl}] DEX 매도: {amt:,.0f} — 최우선 확인")
+                elif looks_exchange(t):
+                    alerts.append(f"👁 관찰지갑 [{lbl}] 거래소 추정 입금: {amt:,.0f} (매도 준비 가능)")
+                else:
+                    alerts.append(f"👁 관찰지갑 [{lbl}] 발신: {amt:,.0f} → {short(t)}")
+            if t in WATCHLIST:
+                alerts.append(f"👁 관찰지갑 [{WATCHLIST[t]}] 수신: +{amt:,.0f} ← {short(f)}")
+
+        # ── 팀 클러스터 전염: 팀 지갑에서 물량 받으면 팀 취급 ──
+        if f in team and amt > 0:
+            if t not in team and t != pair_addr and not looks_exchange(t):
+                team.add(t)
+                alerts.append(f"🏗️ 팀 물량 분배: {short(f)}(팀) → {short(t)} {amt:,.0f} — 이 지갑도 팀 클러스터로 추적 시작")
+
+        # ── DEX 페어로 유입 = 실제 매도 (유동성 감소보다 빠른 선행 신호) ──
+        if pair_addr and t == pair_addr:
+            pair_inflow_total += amt
+            if f in team:
+                pair_inflow_team += amt
+                alerts.append(f"🚨 팀 클러스터가 DEX에 매도: {short(f)} → 페어 {amt:,.0f} — 러그 경보 최상급")
+            elif amt >= WHALE_THRESHOLD:
+                alerts.append(f"📉 대형 DEX 매도: {short(f)} → 페어 {amt:,.0f}")
+
+        # 기본 패턴
+        if amt >= WHALE_THRESHOLD and t != pair_addr:
+            tag = " (거래소 추정 ⚠️)" if looks_exchange(t) else ""
+            alerts.append(f"🐋 대형 이동: {amt:,.0f} → {short(t)}{tag}")
+        if t not in seen and amt >= WHALE_THRESHOLD and t != pair_addr:
+            alerts.append(f"👶 신규 지갑에 대형 수령: {short(t)} +{amt:,.0f}")
+        seen.add(f); seen.add(t)
+
+    # ── 임계값 회피 쪼개기: 같은 발신→수신, 개별은 작지만 합산 초과 ──
+    for (f, t), amts in by_pairkey.items():
+        if len(amts) >= 3 and max(amts) < WHALE_THRESHOLD and sum(amts) >= WHALE_THRESHOLD:
+            alerts.append(f"🔪 쪼개기 전송 감지: {short(f)} → {short(t)} {len(amts)}회 합계 {sum(amts):,.0f} (임계값 회피 패턴)")
+
+    # ── 경유 세탁 (peel chain): 받자마자 90%+ 즉시 재발송 ──
+    for w in received_now:
+        r, s = received_now[w], sent_now.get(w, 0)
+        if r >= WHALE_THRESHOLD / 2 and s >= r * 0.9 and w != pair_addr:
+            alerts.append(f"🔗 경유 지갑 감지: {short(w)} 수령 {r:,.0f} → 즉시 {s:,.0f} 재발송 (출처 세탁 패턴)")
+            if any(x["from"] in team for x in by_recipient.get(w, [])):
+                team.add(w)
+
+    # ── 워시 루프: A→B와 B→A가 같은 배치에 ──
+    for (f, t) in list(by_pairkey.keys()):
+        if f < t and (t, f) in by_pairkey:
+            tot = sum(by_pairkey[(f, t)]) + sum(by_pairkey[(t, f)])
+            if tot >= WHALE_THRESHOLD:
+                alerts.append(f"🔄 왕복 이동 감지: {short(f)} ↔ {short(t)} 합계 {tot:,.0f} (워시/교란 가능)")
+
+    # ── 분산 이동 / 집결 (기존) ──
+    for f, lst in by_sender.items():
+        recips = {x["to"] for x in lst} - {pair_addr}
+        total = sum(x["amount"] for x in lst if x["to"] != pair_addr)
+        if len(recips) >= 5 and total >= WHALE_THRESHOLD:
+            tag = " [팀!]" if f in team else ""
+            alerts.append(f"🪓 분산 이동: {short(f)}{tag} → {len(recips)}개 지갑 합계 {total:,.0f}")
+    for t, lst in by_recipient.items():
+        sndrs = {x["from"] for x in lst}
+        total = sum(x["amount"] for x in lst)
+        if len(sndrs) >= 5 and total >= WHALE_THRESHOLD and not looks_exchange(t) and t != pair_addr:
+            alerts.append(f"🧲 물량 집결: {len(sndrs)}개 지갑 → {short(t)} 합계 {total:,.0f}")
+
+    # ── 상위 지갑 대량 유출 (기존) ──
+    top_set = {a for a, _ in sorted(ledger.items(), key=lambda x: -x[1])[:10]}
+    for f, lst in by_sender.items():
+        if f in top_set:
+            out_amt = sum(x["amount"] for x in lst)
+            bal_before = ledger.get(f, 0) + out_amt
+            if bal_before > 0 and out_amt / bal_before > 0.5 and out_amt >= WHALE_THRESHOLD / 3:
+                alerts.append(f"📤 상위 지갑 대량 유출: {short(f)} 관찰 보유량의 {out_amt/bal_before:.0%} 발신")
+
+    # ── 매집 판정 ──
+    acc = chain_state.setdefault("accum", {})
+    for addr, rec in acc.items():
+        if addr in WATCHLIST or addr in team or looks_exchange(addr):
+            continue
+        bal = ledger.get(addr, 0)
+        # DEX 매집: 3회+ 매수 & 누적 5만+ & 안 팔고 보유 중
+        dex_hit = (rec["buy_n"] >= 3 and rec["buy_amt"] >= WHALE_THRESHOLD / 2
+                   and bal >= rec["buy_amt"] * 0.7)
+        # 이체 매집: 3회+ 수신 & 누적 10만+ & 유출 거의 없음
+        otc_hit = (rec["in_n"] >= 3 and rec["in_amt"] >= WHALE_THRESHOLD
+                   and bal >= rec["in_amt"] * 0.7)
+        total = rec["buy_amt"] + rec["in_amt"]
+        if (dex_hit or otc_hit) and total >= max(rec["alerted"] * 2, 1):
+            kind = "DEX 매수" if dex_hit else "이체 수신"
+            n = rec["buy_n"] if dex_hit else rec["in_n"]
+            alerts.append(f"🧺 매집 감지: {short(addr)} {kind} {n}회 누적 "
+                          f"{total:,.0f} 보유 중 — 새 관찰 후보")
+            rec["alerted"] = total
+    # accum 용량 관리
+    chain_state["accum"] = dict(sorted(
+        acc.items(), key=lambda x: -(x[1]["buy_amt"] + x[1]["in_amt"]))[:200])
+
+    # ── 팀 클러스터 총 매도 요약 ──
+    if pair_inflow_team > 0:
+        alerts.append(f"⚠️ 이번 구간 팀 클러스터 총 DEX 매도: {pair_inflow_team:,.0f} (전체 매도 유입의 {pair_inflow_team/max(pair_inflow_total,1e-9):.0%})")
+
+    # 상태 용량 관리
+    chain_state["ledger"] = dict(sorted(ledger.items(), key=lambda x: -abs(x[1]))[:300])
+    chain_state["recv_count"] = {k: v for k, v in sorted(recv_count.items(), key=lambda x: -len(x[1]))[:200]}
+    chain_state["seen_wallets"] = list(seen)[-2000:]
+    chain_state["team"] = list(team)[:100]
+    if WATCH_ONLY:
+        alerts = [a for a in alerts if "👁" in a]
+    return alerts
+
+
+# ── 지표 (순수 파이썬) ────────────────────────────────
+def ema(arr, n):
+    k, out, p = 2 / (n + 1), [], None
+    for i, v in enumerate(arr):
+        p = v if i == 0 else v * k + p * (1 - k)
+        out.append(p)
+    return out
+
+
+def rsi(cl, n=14):
+    g = l = 0.0
+    val = None
+    for i in range(1, len(cl)):
+        d = cl[i] - cl[i - 1]
+        up, dn = max(d, 0), max(-d, 0)
+        if i <= n:
+            g += up; l += dn
+            if i == n:
+                g /= n; l /= n
+                val = 100 - 100 / (1 + g / (l or 1e-12))
+        else:
+            g = (g * (n - 1) + up) / n
+            l = (l * (n - 1) + dn) / n
+            val = 100 - 100 / (1 + g / (l or 1e-12))
+    return val
+
+
+def macd_hist(cl):
+    f, s = ema(cl, 12), ema(cl, 26)
+    line = [f[i] - s[i] for i in range(len(cl))]
+    sig = ema(line, 9)
+    return [line[i] - sig[i] for i in range(len(cl))]
+
+
+def cvd_series(cs):
+    s, out = 0.0, []
+    for c in cs:
+        s += c["v"] * (1 if c["c"] >= c["o"] else -1)
+        out.append(s)
+    return out
+
+
+avg = lambda a: sum(a) / (len(a) or 1)
+
+
+# ── 신호 규칙 ────────────────────────────────────────
+def build_signals(cs, funding, oi, hl, liq, prev, cgd=None):
+    cgd = cgd or {}
+    cl = [c["c"] for c in cs]
+    p = cl[-1]
+    cvd = cvd_series(cs)
+    diffs = [cvd[i] - cvd[i - 1] for i in range(1, len(cvd))]
+    s10, s30 = avg(diffs[-10:]), avg(diffs[-30:])
+    mh = macd_hist(cl)
+    r = rsi(cl)
+    vol_ratio = cs[-1]["v"] / (avg([c["v"] for c in cs[-20:]]) or 1e-9)
+
+    # 코인글래스 데이터 있으면 우선 사용 (집계 = 더 정확)
+    if cgd.get("funding_w") is not None:
+        funding = cgd["funding_w"]
+    if cgd.get("taker_d30") is not None:
+        s10, s30 = cgd["taker_d10"], cgd["taker_d30"]
+
+    S = []
+    if p < STOP_LEVEL:
+        S.append(("stop", f"🚨 손절선 이탈: {p:.5f} < {STOP_LEVEL} — 시나리오 무효"))
+    elif p < SUPPORT_LEVEL:
+        S.append(("support", f"⚠️ 박스 하단 테스트: {p:.5f} (지지 {SUPPORT_LEVEL})"))
+
+    if s30 < 0 and s10 > s30 * 0.3:
+        S.append(("cvd_ease", f"📉→😐 매도세 둔화: CVD 기울기 30봉 {s30:,.0f} → 10봉 {s10:,.0f}"))
+
+    if funding is not None and funding < 0:
+        S.append(("fund_neg", f"🔻 펀딩비 음수: {funding:.4%} — 숏 우세"))
+    if cgd.get("oi_chg_24h") is not None:
+        oi_chg = cgd["oi_chg_24h"]
+        if funding is not None and funding < -0.0005 and oi_chg > 15:
+            S.append(("squeeze", f"🔥 숏 과밀: 펀딩 {funding:.4%} + 집계OI +{oi_chg:.0f}% — 스퀴즈 조건"))
+        if oi_chg > 15:
+            S.append(("oi_surge", f"📈 집계 OI 급증: 24h +{oi_chg:.0f}%"))
+    elif funding is not None and oi and prev.get("oi"):
+        oi_chg = (oi / prev["oi"] - 1) * 100
+        if funding < -0.0005 and oi_chg > 15:
+            S.append(("squeeze", f"🔥 숏 과밀: 펀딩 {funding:.4%} + OI +{oi_chg:.0f}% — 스퀴즈 조건"))
+        if oi_chg > 15:
+            S.append(("oi_surge", f"📈 OI 급증: +{oi_chg:.0f}%"))
+
+    if r is not None:
+        if r < 27:
+            S.append(("rsi_low", f"🧊 RSI 과매도: {r:.0f}"))
+        elif r > 73:
+            S.append(("rsi_high", f"♨️ RSI 과열: {r:.0f}"))
+
+    if mh[-2] <= 0 < mh[-1]:
+        S.append(("macd_flip", "🟢 MACD 히스토그램 양전환"))
+    if vol_ratio > 4:
+        S.append(("vol_spike", f"💥 거래량 스파이크: 평균의 {vol_ratio:.1f}배"))
+
+    if liq and prev.get("liq"):
+        liq_chg = (liq / prev["liq"] - 1) * 100
+        if liq_chg < -20:
+            S.append(("liq_drop", f"🩸 DEX 유동성 급감: {liq_chg:.0f}%"))
+
+    # 청산 스파이크 (코인글래스)
+    if cgd.get("liq_long_now") is not None:
+        if cgd["liq_long_now"] > cgd["liq_long_avg"] * 5 and cgd["liq_long_now"] > 50_000:
+            S.append(("liq_long", f"💀 롱 대량청산: 1h {usd_short(cgd['liq_long_now'])} (평균의 {cgd['liq_long_now']/cgd['liq_long_avg']:.0f}배) — 바닥 근접 신호일 수 있음"))
+        if cgd["liq_short_now"] > cgd["liq_short_avg"] * 5 and cgd["liq_short_now"] > 50_000:
+            S.append(("liq_short", f"⚡ 숏 대량청산: 1h {usd_short(cgd['liq_short_now'])} — 스퀴즈 진행 중"))
+
+    if hl and hl["funding"] < -0.0005:
+        S.append(("hl_fund", f"🌊 HL 펀딩 깊은 음수: {hl['funding']:.4%}"))
+
+    status = (f"가격 {p:.5f} | RSI {r:.0f} | 펀딩 "
+              f"{funding:.4%}" if funding is not None else f"가격 {p:.5f}")
+    metrics = {"p": p, "rsi": r, "s10": s10, "s30": s30,
+               "mh": mh[-1], "mh_prev": mh[-2], "funding": funding}
+    return S, status, {"oi": oi, "liq": liq, "price": p}, metrics
+
+
+def usd_short(v):
+    """$1,234,567 → $1.2M / $720K / $950"""
+    v = float(v)
+    if abs(v) >= 1e9:
+        return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6:
+        return f"${v/1e6:.2f}M"
+    if abs(v) >= 1e3:
+        return f"${v/1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+# ── 종합 편향 점수 ───────────────────────────────────
+def compute_bias(m, cgd, team_sold, liq_chg):
+    """모든 증거를 -100~+100 점수로 합산. 예측이 아니라 증거의 저울."""
+    score, pos, neg = 0, [], []
+
+    def add(v, why):
+        nonlocal score
+        score += v
+        (pos if v > 0 else neg).append(why)
+
+    # 가격 위치
+    if m["p"] < STOP_LEVEL:
+        add(-30, "손절선 이탈")
+    elif m["p"] < SUPPORT_LEVEL:
+        add(-12, "박스 하단 테스트")
+
+    # 테이커 흐름
+    if m["s30"] < 0 and m["s10"] > m["s30"] * 0.3:
+        add(15, "매도세 둔화")
+    elif m["s10"] < m["s30"] < 0:
+        add(-10, "매도세 가속")
+    elif m["s30"] > 0 and m["s10"] > 0:
+        add(8, "테이커 순매수 지속")
+
+    # 펀딩 × OI
+    f, oc = m.get("funding"), cgd.get("oi_chg_24h")
+    if f is not None and oc is not None:
+        if f < -0.0005 and oc > 15:
+            add(18, "숏 과밀(스퀴즈 연료)")
+        elif f > 0 and oc > 15:
+            add(10, "신규 롱 유입")
+        elif oc < -15:
+            add(-8, "포지션 이탈")
+    if f is not None and f > 0.001:
+        add(-8, "롱 과열 펀딩")
+
+    # 청산
+    if cgd.get("liq_short_now", 0) > cgd.get("liq_short_avg", 1e9) * 5:
+        add(14, "숏 대량청산(스퀴즈 진행)")
+    if cgd.get("liq_long_now", 0) > cgd.get("liq_long_avg", 1e9) * 5:
+        add(-12, "롱 투매 진행")
+
+    # 롱/숏 비율 (역발상: 쏠림의 반대)
+    g = cgd.get("ls_global")
+    if g:
+        if g < 0.8:
+            add(8, f"개미 숏 쏠림({g:.2f})")
+        elif g > 1.6:
+            add(-8, f"개미 롱 쏠림({g:.2f})")
+    t = cgd.get("ls_top")
+    if t:
+        if t > 1.2:
+            add(10, f"탑트레이더 롱 우위({t:.2f})")
+        elif t < 0.8:
+            add(-10, f"탑트레이더 숏 우위({t:.2f})")
+
+    # 선물/현물 구조
+    fv, sv = cgd.get("fut_vol_24h"), cgd.get("spot_vol_24h")
+    if fv and sv and sv > 0:
+        fs = fv / sv
+        if fs > 8:
+            add(-8, f"선물 과열(F/S {fs:.0f}배)")
+        elif fs < 2:
+            add(6, f"현물 주도(F/S {fs:.1f}배)")
+    sd = cgd.get("spot_delta_24h")
+    if sd is not None and sv:
+        if sd > sv * 0.1:
+            add(10, "현물 순매수 우세(실수요)")
+        elif sd < -sv * 0.1:
+            add(-10, "현물 순매도 우세")
+
+    # TA
+    if m["rsi"] < 30:
+        add(8, f"RSI 과매도({m['rsi']:.0f})")
+    elif m["rsi"] > 70:
+        add(-8, f"RSI 과열({m['rsi']:.0f})")
+    if m["mh"] > 0 and m["mh"] > m["mh_prev"]:
+        add(8, "MACD 상승 확대")
+    elif m["mh"] < 0 and m["mh"] < m["mh_prev"]:
+        add(-8, "MACD 하락 확대")
+
+    # 온체인
+    if team_sold:
+        add(-25, "팀 클러스터 매도 감지")
+    if liq_chg is not None:
+        if liq_chg < -20:
+            add(-25, f"DEX 유동성 급감({liq_chg:.0f}%)")
+        elif liq_chg > 10:
+            add(6, "DEX 유동성 증가")
+
+    score = max(-100, min(100, score))
+    verdict = ("상승 우위 📈" if score >= 30 else
+               "하락 우위 📉" if score <= -30 else "중립/혼조 ⚖️")
+    return score, verdict, pos, neg
+
+
+# ── 텔레그램 / 상태 ──────────────────────────────────
+def send(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print(f"[미전송] {text}")
+        return
+    requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                  json={"chat_id": TG_CHAT, "text": text}, timeout=10)
+
+
+def check_commands(state):
+    """텔레그램에서 'update' 명령이 왔는지 확인 (다음 5분 주기에 응답)"""
+    if not TG_TOKEN:
+        return False
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+            params={"offset": state.get("tg_offset", 0) + 1, "timeout": 0},
+            timeout=10)
+        updates = r.json().get("result", [])
+    except Exception as e:
+        print(f"[cmd] {e}")
+        return False
+    want = False
+    for u in updates:
+        state["tg_offset"] = max(state.get("tg_offset", 0), u["update_id"])
+        msg = u.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(TG_CHAT):
+            continue
+        text = (msg.get("text") or "").strip().lower()
+        if text in ("update", "/update", "업데이트", "/start", "status", "/status"):
+            want = True
+    return want
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    with open(STATE_FILE, "w") as f:
+        json.dump(st, f)
+
+
+def main():
+    state = load_state()
+    force_digest = check_commands(state)
+    prev = state.get("prev", {})
+    sent = state.get("sent", {})   # key → 마지막 전송 unixtime
+
+    cs = fetch_candles()
+    funding, oi = fetch_funding(), fetch_oi()
+    hl = fetch_hl()
+    dex = fetch_dex_liquidity()
+    liq = dex["liq"] if dex else None
+    pair_addr = (dex or {}).get("pair", "")
+    chain_alerts = []
+    if ETHERSCAN_KEY and CONTRACTS:
+        all_chain = state.setdefault("chains", {})
+        for chainid, contract in CONTRACTS:
+            cst = all_chain.setdefault(contract, {})
+            if not cst.get("pair"):
+                cst["pair"], cst["symbol"], chain_name = fetch_pair_for(contract)
+                cst["chain_name"] = chain_name
+            if not chainid:  # 시크릿에 체인 미지정 → 자동 판별값 사용
+                chainid = cst.get("chainid") or CHAIN_IDS.get(cst.get("chain_name", ""), "")
+                if not chainid:
+                    print(f"[chain {contract[:10]}] 체인 판별 실패({cst.get('chain_name')}) — "
+                          f"시크릿에 '체인ID:{contract}' 형식으로 지정 필요, 이번엔 스킵")
+                    continue
+            cst["chainid"] = chainid
+            if not cst.get("deployer"):
+                cst["deployer"] = fetch_deployer(chainid, contract)
+            txs = fetch_transfers(chainid, contract, cst.get("last_block", 0) + 1)
+            if not txs:
+                continue
+            cst["last_block"] = max(t["block"] for t in txs)
+            label = cst.get("symbol") or txs[0].get("symbol") or contract[:8]
+            found = analyze_chain(txs, cst, cst.get("pair", ""))
+            chain_alerts += [f"[{label}] {m}" for m in found]
+            print(f"[chain {label}] 전송 {len(txs)}건, 이상 {len(found)}건")
+    cgd = fetch_cg_bundle()
+    if cgd:
+        print(f"[CG] {list(cgd.keys())}")
+
+    signals, status, new_prev, metrics = build_signals(cs, funding, oi, hl, liq, prev, cgd)
+
+    # ── 종합 리포트: 판정 바뀌거나 6시간마다 ──
+    team_sold = any("🚨" in m for m in chain_alerts)
+    liq_chg = ((liq / prev["liq"] - 1) * 100
+               if liq and prev.get("liq") else None)
+    score, verdict, pos_f, neg_f = compute_bias(metrics, cgd, team_sold, liq_chg)
+    now0 = int(time.time())
+    if (force_digest or verdict != state.get("last_verdict")
+            or now0 - state.get("last_digest", 0) > 6 * 3600):
+        lines = [f"📊 종합 리포트 — {verdict} (점수 {score:+d}/100)", status]
+        vol_bits = []
+        if cgd.get("oi_now"):
+            vol_bits.append(f"OI {usd_short(cgd['oi_now'])}")
+        if cgd.get("fut_vol_24h"):
+            vol_bits.append(f"선물24h {usd_short(cgd['fut_vol_24h'])}")
+        if cgd.get("spot_vol_24h"):
+            vol_bits.append(f"현물24h {usd_short(cgd['spot_vol_24h'])}")
+        if cgd.get("fut_vol_24h") and cgd.get("spot_vol_24h"):
+            vol_bits.append(f"F/S {cgd['fut_vol_24h']/max(cgd['spot_vol_24h'],1):.1f}배")
+        if vol_bits:
+            lines.append(" | ".join(vol_bits))
+        if pos_f:
+            lines.append("▲ " + ", ".join(pos_f[:5]))
+        if neg_f:
+            lines.append("▼ " + ", ".join(neg_f[:5]))
+        lines.append("※ 예측 아님 — 현재 증거의 저울. 판단·책임은 본인에게.")
+        send("\n".join(lines))
+        state["last_verdict"], state["last_digest"] = verdict, now0
+        print(f"[digest] {verdict} {score:+d}")
+    print("상태:", status)
+
+    now = int(time.time())
+    fresh = [(k, msg) for k, msg in signals
+             if now - sent.get(k, 0) > REALERT_HOURS * 3600]
+    for k, msg in fresh:
+        print("ALERT:", msg)
+        send(f"[BASED] {msg}\n{status}")
+        sent[k] = now
+
+    # 위험도순 정렬 후 상위 10건만 전송 (전체는 로그에 남음)
+    PRIORITY = ["🚨", "👁", "⚠️", "🏗️", "🧺", "🔪", "🔗", "📤", "🧲", "🪓", "🔄", "📉", "🐋", "👶"]
+    rank = lambda m: next((i for i, e in enumerate(PRIORITY) if e in m[:14]), 99)
+    for msg in chain_alerts:
+        print("CHAIN:", msg)
+    for msg in sorted(chain_alerts, key=rank)[:10]:
+        send(f"[BASED 온체인] {msg}")
+
+    if not prev:  # 최초 실행 인사
+        send(f"🤖 BASED 감시 시작\n{status}")
+
+    # prev(기준값)은 12시간마다 갱신 — 변화율 비교 기준점
+    if not prev or now - state.get("prev_ts", 0) > 12 * 3600:
+        state["prev"] = new_prev
+        state["prev_ts"] = now
+    state["sent"] = sent
+    save_state(state)
+    print(f"신호 {len(signals)}개 / 전송 {len(fresh)}개")
+
+
+if __name__ == "__main__":
+    main()
