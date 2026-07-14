@@ -213,61 +213,108 @@ def cg(path, **params):
         return None
 
 
+def cg_try(paths, intervals=None, **params):
+    """여러 경로 × 여러 인터벌을 순서대로 시도. 첫 성공 반환.
+    Hobbyist 플랜은 짧은 인터벌 미지원 → 4h/12h/1d 자동 폴백."""
+    iv_list = intervals or [params.pop("interval", "4h")]
+    if "interval" in params:
+        params.pop("interval")
+    for iv in iv_list:
+        for p in paths:
+            d = cg(p, interval=iv, **params)
+            if d:
+                return d
+    return None
+
+
 def fetch_cg_bundle():
-    """집계 OI + 가중 펀딩 + 청산 + 테이커 델타 (가능한 것만)"""
+    """집계 OI + 펀딩 + 청산 + 볼륨 + 롱숏 (Hobbyist: 4h 인터벌)"""
     out = {}
-    oi = cg("/api/futures/openInterest/aggregated-history",
-            symbol=COIN, interval="1h", limit=48)
+
+    IVS = ["4h", "12h", "1d"]
+    oi = cg_try([
+        "/api/futures/open-interest/aggregated-history",
+        "/api/futures/openInterest/aggregated-history",
+        "/api/futures/open-interest/aggregated-ohlc-history",
+    ], intervals=IVS, symbol=COIN, limit=60)
     if oi:
         closes = [float(x.get("close") or x.get("c") or 0) for x in oi]
-        if len(closes) >= 2 and closes[0]:
+        if len(closes) >= 2 and closes[-1]:
             out["oi_now"] = closes[-1]
-            out["oi_chg_24h"] = (closes[-1] / closes[max(0, len(closes)-24)] - 1) * 100
+            # 24h 전 인덱스는 인터벌 모르니 대략 마지막에서 되돌아봄
+            back = min(6, len(closes)-1)
+            base = closes[-1-back]
+            out["oi_chg_24h"] = (closes[-1]/base - 1) * 100 if base else 0
 
-    fr = cg("/api/futures/fundingRate/oi-weight-ohlc-history",
-            symbol=COIN, interval="8h", limit=6)
+    fr = cg_try([
+        "/api/futures/funding-rate/oi-weight-history",
+        "/api/futures/funding-rate/oi-weight-ohlc-history",
+    ], intervals=["8h","1d"], symbol=COIN, limit=6)
     if fr:
-        out["funding_w"] = float(fr[-1].get("close") or fr[-1].get("c") or 0)
+        out["funding_w"] = float(fr[-1].get("close") or fr[-1].get("c")
+                                 or fr[-1].get("fundingRate") or 0)
 
-    liq = cg("/api/futures/liquidation/aggregated-history",
-             symbol=COIN, interval="1h", limit=24)
+    liq = cg_try([
+        "/api/futures/liquidation/aggregated-history",
+    ], intervals=IVS, symbol=COIN, limit=12)
     if liq:
-        longs = [float(x.get("longLiquidationUsd") or x.get("long_liquidation_usd") or 0) for x in liq]
-        shorts = [float(x.get("shortLiquidationUsd") or x.get("short_liquidation_usd") or 0) for x in liq]
+        L = lambda x,*k: next((float(x[key]) for key in k if x.get(key) is not None), 0)
+        longs = [L(x,"longLiquidationUsd","long_liquidation_usd","aggregated_long_liquidation_usd") for x in liq]
+        shorts = [L(x,"shortLiquidationUsd","short_liquidation_usd","aggregated_short_liquidation_usd") for x in liq]
         out["liq_long_now"], out["liq_short_now"] = longs[-1], shorts[-1]
         out["liq_long_avg"] = avg(longs[:-1]) or 1e-9
         out["liq_short_avg"] = avg(shorts[:-1]) or 1e-9
 
-    fv = cg("/api/futures/aggregated-volume/history", symbol=COIN,
-            interval="1h", limit=24)
+    fv = cg_try([
+        "/api/futures/aggregated-taker-buy-sell-volume/history",
+    ], intervals=IVS, symbol=COIN, limit=12)
     if fv:
-        vals = [float(x.get("volumeUsd") or x.get("volume_usd") or x.get("v") or 0) for x in fv]
-        out["fut_vol_24h"] = sum(vals)
-    sv = cg("/api/spot/aggregated-taker-buy-sell-volume/history", symbol=COIN,
-            interval="1h", limit=24)
-    if sv:
-        buys = [float(x.get("buy") or x.get("takerBuyVolumeUsd") or 0) for x in sv]
-        sells = [float(x.get("sell") or x.get("takerSellVolumeUsd") or 0) for x in sv]
-        out["spot_vol_24h"] = sum(buys) + sum(sells)
-        out["spot_delta_24h"] = sum(buys) - sum(sells)
+        vol = 0
+        for x in fv:
+            vol += float(x.get("buy") or x.get("taker_buy_volume_usd") or x.get("aggregated_buy_volume_usd") or 0)
+            vol += float(x.get("sell") or x.get("taker_sell_volume_usd") or x.get("aggregated_sell_volume_usd") or 0)
+        if vol: out["fut_vol_24h"] = vol
 
-    gls = cg("/api/futures/global-long-short-account-ratio/history",
-             symbol=COIN, interval="1h", limit=4, exchange="OKX")
+    sv = cg_try([
+        "/api/spot/aggregated-taker-buy-sell-volume/history",
+    ], intervals=IVS, symbol=COIN, limit=12)
+    if sv:
+        buys = sells = 0
+        for x in sv:
+            buys += float(x.get("buy") or x.get("taker_buy_volume_usd") or x.get("aggregated_buy_volume_usd") or 0)
+            sells += float(x.get("sell") or x.get("taker_sell_volume_usd") or x.get("aggregated_sell_volume_usd") or 0)
+        if buys+sells:
+            out["spot_vol_24h"] = buys + sells
+            out["spot_delta_24h"] = buys - sells
+
+    gls = cg_try([
+        "/api/futures/global-long-short-account-ratio/history",
+    ], intervals=IVS, symbol=COIN, limit=4, exchange="Binance")
     if gls:
         out["ls_global"] = float(gls[-1].get("longShortRatio")
+                                 or gls[-1].get("global_account_long_short_ratio")
                                  or gls[-1].get("long_short_ratio") or 0)
-    tls = cg("/api/futures/top-long-short-position-ratio/history",
-             symbol=COIN, interval="1h", limit=4, exchange="OKX")
+
+    tls = cg_try([
+        "/api/futures/top-long-short-position-ratio/history",
+    ], intervals=IVS, symbol=COIN, limit=4, exchange="Binance")
     if tls:
         out["ls_top"] = float(tls[-1].get("longShortRatio")
+                              or tls[-1].get("top_position_long_short_ratio")
                               or tls[-1].get("long_short_ratio") or 0)
 
-    tk = cg("/api/futures/aggregated-taker-buy-sell-volume/history",
-            symbol=COIN, interval="1h", limit=36)
+    tk = cg_try([
+        "/api/futures/aggregated-taker-buy-sell-volume/history",
+    ], intervals=IVS, symbol=COIN, limit=12)
     if tk:
-        deltas = [float(x.get("buy") or x.get("takerBuyVolumeUsd") or 0)
-                  - float(x.get("sell") or x.get("takerSellVolumeUsd") or 0) for x in tk]
-        out["taker_d10"], out["taker_d30"] = avg(deltas[-10:]), avg(deltas[-30:])
+        deltas = []
+        for x in tk:
+            b = float(x.get("buy") or x.get("aggregated_buy_volume_usd") or 0)
+            s = float(x.get("sell") or x.get("aggregated_sell_volume_usd") or 0)
+            deltas.append(b - s)
+        if deltas:
+            out["taker_d10"] = avg(deltas[-3:])
+            out["taker_d30"] = avg(deltas[-6:])
     return out
 
 
