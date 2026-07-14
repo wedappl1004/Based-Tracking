@@ -7,6 +7,13 @@ import json
 import os
 import time
 import requests
+try:
+    import db as _db
+    _db.setup()
+    _DB = True
+except Exception as _e:
+    print(f"[db] 비활성: {_e}")
+    _DB = False
 
 COIN = "BASED"
 OKX = "https://www.okx.com"
@@ -1020,6 +1027,30 @@ def main():
             label = cst.get("symbol") or txs[0].get("symbol") or contract[:8]
             found = analyze_chain(txs, cst, cst.get("pair", ""))
             chain_alerts += [f"[{label}] {m}" for m in found]
+            # batch2 인텔 수집 (DB 있을 때만)
+            if _DB:
+                try:
+                    import intel
+                    cur_p = metrics.get("p") if metrics else None
+                    intel.update_smart_money(contract, txs, cst.get("pair",""), cur_p)
+                    # 자금줄: 새 매집 지갑을 팀으로 자동 분류
+                    dep = cst.get("deployer","")
+                    team = set(cst.get("team", []))
+                    for tx in txs:
+                        buyer = tx["to"]
+                        if buyer != cst.get("pair","") and tx["amount"] >= 50_000:
+                            if intel.trace_funding(chainid, buyer, dep, team):
+                                if buyer not in team:
+                                    chain_alerts.append(f"[{label}] 🕵️ 팀 알트 발견: "
+                                        f"{buyer[:10]}… (자금 출처=배포자) — 팀 클러스터 편입")
+                    # 홀더 분포 스냅샷 (하루 1회)
+                    import time as _t
+                    if _t.time() - cst.get("last_holder_snap",0) > 86400:
+                        halerts = intel.snapshot_holders(chainid, contract, dep)
+                        chain_alerts += [f"[{label}] {m}" for m in halerts]
+                        cst["last_holder_snap"] = _t.time()
+                except Exception as _e:
+                    print(f"[intel] {_e}")
             print(f"[chain {label}] 전송 {len(txs)}건, 이상 {len(found)}건")
     cgd = fetch_cg_bundle()
     if cgd:
@@ -1163,6 +1194,15 @@ def main():
     rank = lambda m: next((i for i, e in enumerate(PRIORITY) if e in m[:14]), 99)
     for msg in chain_alerts:
         print("CHAIN:", msg)
+    # #10 알림 로깅 (성적표용)
+    cur_price = metrics.get("p") if metrics else None
+    if _DB and cur_price:
+        for k, m in signals:
+            _db.log_alert(k, m, cur_price)
+        for msg in chain_alerts:
+            _db.log_alert(msg[:12], msg, cur_price)
+        _db.grade_pending(cur_price)
+
     for msg in sorted(chain_alerts, key=rank)[:10]:
         send(f"[BASED 온체인] {msg}")
 

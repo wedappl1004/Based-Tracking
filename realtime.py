@@ -113,6 +113,25 @@ def main():
                         send(spike_study.run_spike_study())
                     except Exception as e:
                         send(f"분석 실패: {e}")
+                elif text in ("score", "/score", "성적", "성적표"):
+                    print("[명령] score → 성적표")
+                    try:
+                        import db as _db
+                        sc = _db.scorecard(days=30)
+                        if not sc:
+                            send("📋 아직 채점된 알림이 없어요 (알림 발생 후 24시간 지나야 집계). "
+                                 f"저장소: {'Postgres' if _db.is_postgres() else '파일'}")
+                        else:
+                            lines = ["📋 신호 성적표 (최근 30일, 발동→24h 방향 정확도)"]
+                            for kind, d in sorted(sc.items(), key=lambda x:-x[1]["n"]):
+                                if d["n"] >= 1:
+                                    acc = d["up"]/d["n"]*100
+                                    avg = d["sum"]/d["n"]
+                                    lines.append(f"· {kind}: {d['n']}회, 적중 {acc:.0f}%, 평균 {avg:+.1f}%")
+                            lines.append(f"\n저장소: {'Postgres ✓' if _db.is_postgres() else '파일(임시)'}")
+                            send("\n".join(lines))
+                    except Exception as e:
+                        send(f"성적표 실패: {e}")
                 elif text in ("premove", "/premove", "전조분석", "전조"):
                     print("[명령] premove → 전조 부검")
                     send("🔍 전조 부검 시작 — 과거 급등/급락 전 패턴 분석 중 (1~2분)…")
@@ -131,7 +150,7 @@ def main():
                     except Exception as e:
                         send(f"학습 실패: {e}")
                 elif text:
-                    send("아는 명령:\nupdate — 종합 리포트\nspike — 0.32 고점 조작 분석\ntrain — 전체 히스토리 학습\npremove — 과거 급등/급락 전조 부검")
+                    send("아는 명령:\nupdate — 종합 리포트\nspike — 0.32 고점 조작 분석\ntrain — 전체 히스토리 학습\npremove — 과거 급등/급락 전조 부검\nscore — 신호 성적표 (자동 채점)")
         except requests.exceptions.RequestException as e:
             print(f"[poll] 네트워크 문제, 10초 후 재시도: {e}")
             time.sleep(10)
