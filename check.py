@@ -26,6 +26,10 @@ try:
 except Exception:
     pass
 REALERT_HOURS = 6       # 같은 신호 재알림 간격
+# 급등/급락 감지 (15분봉 기준)
+MOVE_15M_PCT = 3.0      # 15분 ±3% 이상이면 알림
+MOVE_1H_PCT = 8.0       # 1시간 ±8% 이상이면 알림
+MOVE_ATR_MULT = 3.0     # 평소 변동성(ATR)의 3배 이상 캔들
 STATE_FILE = "state.json"
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -100,7 +104,6 @@ WATCHLIST = {
     "0x87180fee757025fe489cb73b7c9e5b8d0a15b6e1": "0x8718",
     "0xa97111aac0732c41b99da656c0860f7a482493d6": "0xa971",
     "0x46e21fa3a6b5d2ec25dd756d445891e3ef9fbb51": "0x46e2",
-    "0xb38d5a0516c7a91509f9f17115113b8dbc96d184": "0xb38d",
     "0x116e92ff3a89d6c8951358ca21888863bfd3ba4e": "0x116e",
     "0x7eee7d761cd46f9e430c9d55b40ef3de63de6ee4": "0x7eee",
     "0x8f01a3ecfa602650ac920ae93fad4168b0b34a6c": "0x8f01",
@@ -120,6 +123,9 @@ WATCH_MIN = 1_000   # 워치리스트 알림 최소 수량 (더스트 스팸 방
 # True = 온체인 알림은 내 워치리스트 지갑만 (조용함)
 # False = 모든 지갑의 수상한 움직임도 알림 (매집/고래/쪼개기 등)
 WATCH_ONLY = True
+MEGA_THRESHOLD = 1_000_000   # 이 이상 단일 이동은 지갑 무관 무조건 알림
+SURGE_MULT = 5               # 사이클 총 이동량이 평소의 N배면 서지 경보
+NEWWALLET_MULT = 3           # 신규 지갑 등장이 평소의 N배(그리고 10개+)면 경보
 # WATCH_ONLY여도 팀 클러스터의 대형 DEX 매도(러그 경보)는 항상 알림
 TEAM_SELL_MIN = 50_000
 
@@ -392,6 +398,7 @@ def analyze_chain(txs, chain_state, pair_addr=""):
     ledger = chain_state.setdefault("ledger", {})
     recv_count = chain_state.setdefault("recv_count", {})
     seen = set(chain_state.setdefault("seen_wallets", []))
+    seen_before = set(seen)  # 이번 배치 전 기준 (신규 지갑 판정용)
     team = set(chain_state.setdefault("team", []))       # 팀 클러스터 (전염 추적)
     deployer = chain_state.get("deployer", "")
     if deployer:
@@ -534,6 +541,39 @@ def analyze_chain(txs, chain_state, pair_addr=""):
     chain_state["accum"] = dict(sorted(
         acc.items(), key=lambda x: -(x[1]["buy_amt"] + x[1]["in_amt"]))[:200])
 
+    # ── #1 CEX 넷플로우 (거래소 입출금 순유입) ──
+    try:
+        import netflow
+        alerts += netflow.analyze_netflow(txs, chain_state)
+    except Exception as _e:
+        print(f"[netflow] {_e}")
+
+    # ── 시스템 레벨 이상 징후 (지갑 무관, 워치리스트 모드에서도 알림) ──
+    cycle_vol = sum(tx["amount"] for tx in txs)
+    new_wallets_n = sum(1 for tx in txs
+                        for a in (tx["from"], tx["to"])
+                        if a not in seen_before)
+    vh = chain_state.setdefault("vol_hist", [])
+    nh = chain_state.setdefault("neww_hist", [])
+    if len(vh) >= 6:  # 기준선 확보 후부터 판정 (약 30분치)
+        base_v = sorted(vh)[len(vh)//2] or 1e-9   # 중앙값
+        base_n = sorted(nh)[len(nh)//2]
+        if cycle_vol > base_v * SURGE_MULT and cycle_vol >= WHALE_THRESHOLD:
+            alerts.append(f"🌊 온체인 물량 서지: 이번 구간 {cycle_vol:,.0f} 이동 "
+                          f"(평소의 {cycle_vol/base_v:.0f}배) — 대규모 재배치/덤핑 가능")
+        if new_wallets_n >= 10 and new_wallets_n > max(base_n, 1) * NEWWALLET_MULT:
+            alerts.append(f"👥 신규 지갑 급증: 이번 구간 {new_wallets_n}개 첫 등장 "
+                          f"(평소 {base_n}개) — 분배 준비/시빌 활동 가능")
+    vh.append(cycle_vol); nh.append(new_wallets_n)
+    chain_state["vol_hist"] = vh[-48:]
+    chain_state["neww_hist"] = nh[-48:]
+
+    # 메가 단일 이동 (지갑 무관)
+    for tx in txs:
+        if tx["amount"] >= MEGA_THRESHOLD and tx["to"] != pair_addr:
+            alerts.append(f"🐳 메가 이동: {tx['amount']:,.0f} "
+                          f"{short(tx['from'])} → {short(tx['to'])}")
+
     # ── 팀 클러스터 총 매도 요약 ──
     if pair_inflow_team >= TEAM_SELL_MIN:
         alerts.append(f"🚨 이번 구간 팀 클러스터 총 DEX 매도: {pair_inflow_team:,.0f} (전체 매도 유입의 {pair_inflow_team/max(pair_inflow_total,1e-9):.0%})")
@@ -544,7 +584,8 @@ def analyze_chain(txs, chain_state, pair_addr=""):
     chain_state["seen_wallets"] = list(seen)[-2000:]
     chain_state["team"] = list(team)[:100]
     if WATCH_ONLY:
-        alerts = [a for a in alerts if "👁" in a or a.startswith("🚨")]
+        _keep = ("👁","🚨","🌊","👥","🐳","📥","📤","🔀")
+        alerts = [a for a in alerts if "👁" in a or any(a.startswith(e) for e in _keep)]
     return alerts
 
 
@@ -617,6 +658,97 @@ def build_signals(cs, funding, oi, hl, liq, prev, cgd=None):
     elif p < SUPPORT_LEVEL:
         S.append(("support", f"⚠️ 박스 하단 테스트: {p:.5f} (지지 {SUPPORT_LEVEL})"))
 
+    # ── 전조 신호: 급변동 "전"의 판 짜임 감지 ──
+    if len(cl) >= 60:
+        # 최근 24캔들(6시간) 가격 변화 & 변동성 상태
+        chg_6h = abs(cl[-1] / cl[-24] - 1) * 100
+        rng_recent = avg([abs(cs[i]["h"] - cs[i]["l"]) / cs[i]["c"]
+                          for i in range(len(cs) - 12, len(cs))])
+        rng_base = avg([abs(cs[i]["h"] - cs[i]["l"]) / cs[i]["c"]
+                        for i in range(len(cs) - 60, len(cs) - 12)])
+        compressed = rng_base > 0 and rng_recent < rng_base * 0.55
+        oi_up = cgd.get("oi_chg_24h") is not None and cgd["oi_chg_24h"] > 8
+        flat = chg_6h < 2.0
+
+        # 1) 변동성 압축 + OI 축적 = 스프링 감기는 중
+        if compressed and oi_up:
+            hint = ""
+            if funding is not None:
+                hint = " · 펀딩 음수→상방 스퀴즈 우세" if funding < -0.0002 else                        (" · 펀딩 과열→하방 청산 우세" if funding > 0.0005 else " · 방향 미정")
+            S.append(("pre_squeeze",
+                      f"🧨 전조: 변동성 압축 + OI +{cgd['oi_chg_24h']:.0f}% — 큰 움직임 준비 중{hint}"))
+
+        soft_comp = rng_base > 0 and rng_recent < rng_base * 0.75
+
+        # 2) 조용한 매집: 횡보 + 순매수 지속 + (OI 축적 or 변동성 압축) 동반 필수
+        if flat and s10 > 0 and s30 > 0 and (oi_up or soft_comp):
+            extra = f" + OI {cgd['oi_chg_24h']:+.0f}%" if oi_up else " (변동성 압축 동반)"
+            S.append(("quiet_accum",
+                      f"🤫 전조: 조용한 매집 — 가격 횡보 중 테이커 순매수 지속{extra} (급등 전 패턴)"))
+
+        # 3) 조용한 분산: 횡보 + 순매도 지속 + (압축 or OI 축적) 동반 필수
+        if flat and s10 < 0 and s30 < 0 and (soft_comp or oi_up):
+            S.append(("quiet_dist",
+                      f"🫗 전조: 조용한 분산 — 가격 횡보 중 테이커 순매도 지속 (급락 전 패턴)"))
+
+        # ── 학습된 전조 매칭 (premove 부검 결과와 실시간 대조) ──
+        try:
+            with open("premove_params.json") as _pf:
+                _learned = json.load(_pf)
+        except Exception:
+            _learned = None
+        if _learned:
+            # 현재 켜진 전조 집합 (부검과 동일 기준)
+            v_recent = avg([c["v"] for c in cs[-12:]])
+            v_base = avg([c["v"] for c in cs[-48:-12]]) or 1e-9
+            active = {
+                "압축": compressed,
+                "매집": flat and s10 > 0 and s30 > 0,
+                "분산": flat and s10 < 0 and s30 < 0,
+                "거래량고갈": v_recent < v_base * 0.6,
+                "RSI과매도": r is not None and r < 35,
+                "RSI과열": r is not None and r > 65,
+            }
+            for bucket, emoji, label in (("pump", "📡🚀", "급등"), ("dump", "📡📉", "급락")):
+                hits = [(k, _learned[bucket][k]) for k in _learned.get(bucket, {})
+                        if active.get(k)]
+                if hits:
+                    names = "+".join(k for k, _ in hits)
+                    stats = ", ".join(f"{k}: 과거 {v['rate']}%/평시 {v['lift']}배"
+                                      for k, v in hits)
+                    strength = "⚠️ 복합" if len(hits) >= 2 else ""
+                    S.append((f"learned_{bucket}",
+                              f"{emoji} 학습된 {label} 전조 감지 {strength}[{names}] — {stats}"))
+
+    # ── 급등/급락 감지 (15분봉 ±3% / 1시간 ±8% / ATR 3배) ──
+    if len(cl) >= 5:
+        chg_15m = (cl[-1] / cl[-2] - 1) * 100
+        chg_1h = (cl[-1] / cl[-5] - 1) * 100
+        why = []
+        if funding is not None:
+            why.append(f"펀딩 {funding:.3%}")
+        if s30 < 0:
+            why.append("매도세 진행중")
+        elif s10 > 0:
+            why.append("테이커 매수 우위")
+        why_str = (" | " + ", ".join(why)) if why else ""
+        if chg_15m >= MOVE_15M_PCT:
+            S.append(("pump_15m", f"🚀 급등 감지: 15분 {chg_15m:+.1f}% (가격 {p:.5f}){why_str}"))
+        elif chg_15m <= -MOVE_15M_PCT:
+            S.append(("dump_15m", f"📉 급락 감지: 15분 {chg_15m:+.1f}% (가격 {p:.5f}){why_str}"))
+        if chg_1h >= MOVE_1H_PCT:
+            S.append(("pump_1h", f"🚀🚀 강한 급등: 1시간 {chg_1h:+.1f}%{why_str}"))
+        elif chg_1h <= -MOVE_1H_PCT:
+            S.append(("dump_1h", f"📉📉 강한 급락: 1시간 {chg_1h:+.1f}%{why_str}"))
+        rng = [abs(cs[i]["h"] - cs[i]["l"]) for i in range(max(0, len(cs)-15), len(cs)-1)]
+        if rng:
+            avg_rng = avg(rng)
+            last_rng = abs(cs[-1]["h"] - cs[-1]["l"])
+            if (avg_rng > 0 and last_rng > avg_rng * MOVE_ATR_MULT
+                    and last_rng > p * 0.015):  # 최소 절대폭 1.5% (초저변동 오탐 방지)
+                direction = "상방" if cs[-1]["c"] >= cs[-1]["o"] else "하방"
+                S.append(("atr_spike", f"⚡ 변동성 폭발: 평소의 {last_rng/avg_rng:.1f}배 캔들 ({direction})"))
+
     if s30 < 0 and s10 > s30 * 0.3:
         S.append(("cvd_ease", f"📉→😐 매도세 둔화: CVD 기울기 30봉 {s30:,.0f} → 10봉 {s10:,.0f}"))
 
@@ -650,6 +782,18 @@ def build_signals(cs, funding, oi, hl, liq, prev, cgd=None):
         liq_chg = (liq / prev["liq"] - 1) * 100
         if liq_chg < -20:
             S.append(("liq_drop", f"🩸 DEX 유동성 급감: {liq_chg:.0f}%"))
+
+    # #8 펀딩 극단 카운트다운 (8h마다 정산)
+    _fc = funding if funding is not None else cgd.get("funding_w")
+    if _fc is not None and abs(_fc) > 0.001:
+        import datetime as _dt
+        _u = _dt.datetime.utcnow()
+        _mins = (8 - _u.hour % 8) * 60 - _u.minute
+        if 0 <= _mins <= 30:
+            _side = "숏→롱 지급" if _fc > 0 else "롱→숏 지급"
+            S.append(("funding_countdown",
+                      f"⏰ {_mins}분 후 펀딩 정산: {_fc:.3%} ({_side}, "
+                      f"{'상방 스퀴즈' if _fc<0 else '하방 압력'} 창구)"))
 
     # 청산 스파이크 (코인글래스)
     if cgd.get("liq_long_now") is not None:
@@ -960,15 +1104,62 @@ def main():
     print("상태:", status)
 
     now = int(time.time())
+    FAST_KEYS = ("pump_15m", "dump_15m", "pump_1h", "dump_1h", "atr_spike")
+    PRE_KEYS = ("pre_squeeze", "quiet_accum", "quiet_dist",
+                "learned_pump", "learned_dump")
     fresh = [(k, msg) for k, msg in signals
-             if now - sent.get(k, 0) > REALERT_HOURS * 3600]
+             if now - sent.get(k, 0) > (3600 if k in FAST_KEYS
+                                        else 7200 if k in PRE_KEYS
+                                        else REALERT_HOURS * 3600)]
     for k, msg in fresh:
         print("ALERT:", msg)
         send(f"[BASED] {msg}\n{status}")
         sent[k] = now
 
+    # ── #9 시나리오 엔진: 개별 신호를 플레이북 서사로 ──
+    try:
+        import scenario
+        all_active = [(k, m) for k, m in signals]
+        all_active += [(a[:12], a) for a in chain_alerts]
+        scen = scenario.evaluate_scenarios(all_active)
+        scen_msg = scenario.format_scenario_alert(scen)
+        if scen_msg:
+            # 최고 진행도 플레이북이 3막+ 진행이면 즉시, 아니면 다이제스트에만
+            top = scen[0]
+            skey = f"scenario_{top['name']}_{top['done']}"
+            if top["done"] >= 3 and now0 - state.get("sent", {}).get(skey, 0) > 3600:
+                send(scen_msg)
+                state.setdefault("sent", {})[skey] = now0
+                print(f"[시나리오] {top['name']} {top['done']}/{top['total']}")
+    except Exception as _e:
+        print(f"[scenario] {_e}")
+
+    # ── #12 일일 브리핑 (하루 1회, UTC 0시경) ──
+    try:
+        import datetime as _dt
+        _h = _dt.datetime.utcnow().hour
+        _today = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+        if _h == 0 and state.get("last_brief") != _today:
+            brief = [f"☀️ BASED 일일 브리핑 {_today}"]
+            brief.append(status)
+            if cgd.get("oi_now"):
+                brief.append(f"OI {usd_short(cgd['oi_now'])} ({cgd.get('oi_chg_24h',0):+.0f}%)")
+            nf = chain_state.get("netflow_hist", [])
+            if nf:
+                day_net = sum(nf[-min(len(nf),288):])
+                brief.append(f"온체인 CEX 순유입(24h 누적): {day_net:+,.0f} "
+                             f"({'매도압↑' if day_net>0 else '완화'})")
+            brief.append(f"종합: {verdict} ({score:+d})")
+            if scen:
+                brief.append(f"주의 플레이북: {scen[0]['emoji']} {scen[0]['name']} "
+                             f"{scen[0]['done']}/{scen[0]['total']}막")
+            send("\n".join(brief))
+            state["last_brief"] = _today
+    except Exception as _e:
+        print(f"[brief] {_e}")
+
     # 위험도순 정렬 후 상위 10건만 전송 (전체는 로그에 남음)
-    PRIORITY = ["🚨", "👁", "⚠️", "🏗️", "🧺", "🔪", "🔗", "📤", "🧲", "🪓", "🔄", "📉", "🐋", "👶"]
+    PRIORITY = ["🚨", "📥", "🌊", "🐳", "👥", "👁", "🔀", "⚠️", "🏗️", "🧺", "🔪", "🔗", "📤", "🧲", "🪓", "🔄", "📉", "🐋", "👶"]
     rank = lambda m: next((i for i, e in enumerate(PRIORITY) if e in m[:14]), 99)
     for msg in chain_alerts:
         print("CHAIN:", msg)
