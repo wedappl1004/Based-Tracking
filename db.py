@@ -103,10 +103,10 @@ def grade_pending(current_price):
     return graded
 
 
-def scorecard(days=7):
-    """신호별 성적: 발동 후 24h 방향 정확도"""
+def scorecard(days=30):
+    """신호별 성적: 24h 방향 적중률 + baseline 대비 lift + 가중치 산출.
+    baseline = 전체 알림의 평균 24h 변화(무작위 진입 근사)."""
     since = int(time.time()) - days * 86400
-    stats = {}
     if _PG:
         cur = _conn.cursor()
         cur.execute("""SELECT kind, price, price_24h FROM alerts
@@ -117,20 +117,74 @@ def scorecard(days=7):
         rows = [(r["kind"], r["price"], r["price_24h"])
                 for r in _read_file("alerts")
                 if r["ts"] >= since and r.get("price_24h") and r.get("price")]
+    if not rows:
+        return {}
+
+    # baseline: 전체 24h 변화 평균 (아무 때나 들어갔을 때의 기대값)
+    all_chg = [(p24 / p0 - 1) * 100 for _, p0, p24 in rows]
+    baseline = sum(all_chg) / len(all_chg)
+
+    stats = {}
     for kind, p0, p24 in rows:
-        d = stats.setdefault(kind, {"n": 0, "up": 0, "sum": 0.0})
         chg = (p24 / p0 - 1) * 100
+        d = stats.setdefault(kind, {"n": 0, "hit": 0, "sum": 0.0})
         d["n"] += 1
         d["sum"] += chg
-        # 급등류는 상승이 '적중', 급락/매도류는 하락이 '적중'
-        bullish = any(t in kind for t in ("pump", "accum", "squeeze", "long"))
-        bearish = any(t in kind for t in ("dump", "dist", "stop", "liq_long", "netflow"))
-        if (bullish and chg > 0) or (bearish and chg < 0):
-            d["up"] += 1
-        elif not bullish and not bearish:
-            if chg > 0:
-                d["up"] += 1
+        bullish = any(t in kind for t in ("pump", "accum", "squeeze", "long", "🚀", "🟢", "📡🚀"))
+        bearish = any(t in kind for t in ("dump", "dist", "stop", "liq_long", "netflow", "📉", "🔴", "🚨", "📥"))
+        if bullish and chg > 0:
+            d["hit"] += 1
+        elif bearish and chg < 0:
+            d["hit"] += 1
+        elif not bullish and not bearish and chg > 0:
+            d["hit"] += 1
+
+    # lift + 가중치 계산
+    for kind, d in stats.items():
+        avg = d["sum"] / d["n"]
+        d["avg"] = avg
+        d["acc"] = d["hit"] / d["n"] * 100
+        # 방향 고려한 lift: 이 신호로 진입했을 때 baseline 대비 초과 성과
+        bullish = any(t in kind for t in ("pump","accum","squeeze","long","🚀","🟢","📡🚀"))
+        d["lift"] = (avg - baseline) if bullish else (baseline - avg)             if any(t in kind for t in ("dump","dist","stop","netflow","📉","🚨","📥")) else abs(avg - baseline)
+        # 가중치: lift 양수 + 표본 충분하면 신뢰, 아니면 감쇠 (0.3~1.5)
+        if d["n"] < 3:
+            d["weight"] = 1.0  # 표본 부족 → 중립 유지
+        elif d["lift"] > 0:
+            d["weight"] = min(1.5, 1.0 + d["lift"] / 10)
+        else:
+            d["weight"] = max(0.3, 1.0 + d["lift"] / 10)
+    stats["_baseline"] = {"avg": baseline, "n": len(rows)}
     return stats
+
+
+def save_weights(stats):
+    """산출된 가중치를 signal_weights 테이블/파일에 저장 → check.py가 로드"""
+    weights = {k: round(v["weight"], 2) for k, v in stats.items()
+               if k != "_baseline" and "weight" in v}
+    if _PG:
+        cur = _conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS signal_weights "
+                    "(kind TEXT PRIMARY KEY, weight REAL, updated BIGINT)")
+        for k, w in weights.items():
+            cur.execute("INSERT INTO signal_weights VALUES (%s,%s,%s) "
+                        "ON CONFLICT (kind) DO UPDATE SET weight=%s, updated=%s",
+                        (k, w, int(time.time()), w, int(time.time())))
+    else:
+        _write_kv("signal_weights", weights)
+    return weights
+
+
+def load_weights():
+    if _PG:
+        try:
+            cur = _conn.cursor()
+            cur.execute("SELECT kind, weight FROM signal_weights")
+            return {k: w for k, w in cur.fetchall()}
+        except Exception:
+            return {}
+    else:
+        return _read_kv("signal_weights")
 
 
 # ── 홀더 분포 (#2) ──

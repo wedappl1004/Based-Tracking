@@ -86,6 +86,7 @@ def main():
 
     offset = load_offset()
     last_monitor = 0.0
+    _last_weight_week = [""]
 
     while True:
         # ── 명령 대기 (long-poll 20초: 메시지 오면 그 즉시 반환) ──
@@ -122,13 +123,20 @@ def main():
                             send("📋 아직 채점된 알림이 없어요 (알림 발생 후 24시간 지나야 집계). "
                                  f"저장소: {'Postgres' if _db.is_postgres() else '파일'}")
                         else:
-                            lines = ["📋 신호 성적표 (최근 30일, 발동→24h 방향 정확도)"]
-                            for kind, d in sorted(sc.items(), key=lambda x:-x[1]["n"]):
+                            base = sc.get("_baseline", {}).get("avg", 0)
+                            lines = [f"📋 신호 성적표 (30일) · 기준선 {base:+.1f}%/24h"]
+                            ranked = sorted([(k,v) for k,v in sc.items() if k!="_baseline"],
+                                            key=lambda x:-x[1].get("lift",0))
+                            for kind, d in ranked:
                                 if d["n"] >= 1:
-                                    acc = d["up"]/d["n"]*100
-                                    avg = d["sum"]/d["n"]
-                                    lines.append(f"· {kind}: {d['n']}회, 적중 {acc:.0f}%, 평균 {avg:+.1f}%")
-                            lines.append(f"\n저장소: {'Postgres ✓' if _db.is_postgres() else '파일(임시)'}")
+                                    tag = "🟢" if d.get("lift",0)>0 else "🔴"
+                                    lines.append(f"{tag} {kind}: {d['n']}회, 적중 {d.get('acc',0):.0f}%, "
+                                                 f"평균 {d.get('avg',0):+.1f}%, lift {d.get('lift',0):+.1f}%, "
+                                                 f"가중 {d.get('weight',1):.1f}x")
+                            # 가중치 저장 (자가학습)
+                            w = _db.save_weights(sc)
+                            lines.append(f"\n✅ 가중치 {len(w)}개 갱신 — 다음 리포트부터 반영")
+                            lines.append(f"저장소: {'Postgres ✓' if _db.is_postgres() else '파일(임시)'}")
                             send("\n".join(lines))
                     except Exception as e:
                         send(f"성적표 실패: {e}")
@@ -163,6 +171,21 @@ def main():
             print(f"[감시] 정기 사이클 실행 {time.strftime('%H:%M:%S')}")
             run_cycle()
             last_monitor = time.time()
+            # 주 1회 가중치 자동 재계산 (일요일)
+            try:
+                import datetime as _dt, db as _db
+                _n = _dt.datetime.utcnow()
+                if _n.weekday() == 6 and _n.hour == 1:
+                    _wk = _n.strftime("%Y-%W")
+                    if _last_weight_week[0] != _wk:
+                        sc = _db.scorecard(30)
+                        if sc:
+                            w = _db.save_weights(sc)
+                            send(f"🔄 주간 자가학습 완료 — 신호 가중치 {len(w)}개 갱신. "
+                                 f"성적 나쁜 신호는 자동 감쇠됨. (score로 확인)")
+                        _last_weight_week[0] = _wk
+            except Exception as _e:
+                print(f"[weekly] {_e}")
 
 
 if __name__ == "__main__":

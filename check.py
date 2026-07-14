@@ -11,9 +11,13 @@ try:
     import db as _db
     _db.setup()
     _DB = True
+    _WEIGHTS = _db.load_weights()
+    if _WEIGHTS:
+        print(f"[db] 학습 가중치 {len(_WEIGHTS)}개 로드")
 except Exception as _e:
     print(f"[db] 비활성: {_e}")
     _DB = False
+    _WEIGHTS = {}
 
 COIN = "BASED"
 OKX = "https://www.okx.com"
