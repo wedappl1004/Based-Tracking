@@ -105,8 +105,25 @@ def main():
                     send("⏳ 리포트 생성 중… (10~20초)")
                     run_cycle(force=True)
                     last_monitor = time.time()
+                elif text in ("spike", "/spike", "조사"):
+                    print("[명령] spike → 스파이크 분석")
+                    send("🔬 스파이크 분석 시작 — 히스토리 수집 중 (1~2분)…")
+                    try:
+                        import spike_study
+                        send(spike_study.run_spike_study())
+                    except Exception as e:
+                        send(f"분석 실패: {e}")
+                elif text in ("train", "/train", "학습"):
+                    print("[명령] train → 학습")
+                    send("🎓 학습 시작 — 전체 히스토리 수집 중 (1~2분)…")
+                    try:
+                        import backtest
+                        _, rep = backtest.run_backtest()
+                        send(rep)
+                    except Exception as e:
+                        send(f"학습 실패: {e}")
                 elif text:
-                    send("아는 명령: update / status\n(그 외 자동 알림은 알아서 갑니다)")
+                    send("아는 명령:\nupdate — 종합 리포트\nspike — 0.32 고점 조작 분석\ntrain — 전체 히스토리 학습")
         except requests.exceptions.RequestException as e:
             print(f"[poll] 네트워크 문제, 10초 후 재시도: {e}")
             time.sleep(10)
