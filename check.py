@@ -213,17 +213,25 @@ def cg(path, **params):
         return None
 
 
-def cg_try(paths, intervals=None, **params):
-    """여러 경로 × 여러 인터벌을 순서대로 시도. 첫 성공 반환.
-    Hobbyist 플랜은 짧은 인터벌 미지원 → 4h/12h/1d 자동 폴백."""
+# BASED가 상장된 거래소 후보 (롱숏/페어 조회용, 순서대로 시도)
+CG_EXCHANGES = ["OKX", "Bybit", "Gate", "Binance", "Bitget", "HTX"]
+# 집계 엔드포인트용 exchange_list (필수 파라미터)
+CG_EXLIST = "OKX,Bybit,Gate,Binance,Bitget"
+
+def cg_try(paths, intervals=None, exchanges=None, **params):
+    """경로 × 인터벌 × (필요시)거래소 조합을 순서대로 시도. 첫 성공 반환."""
     iv_list = intervals or [params.pop("interval", "4h")]
-    if "interval" in params:
-        params.pop("interval")
+    params.pop("interval", None)
+    ex_list = exchanges or [None]
     for iv in iv_list:
-        for p in paths:
-            d = cg(p, interval=iv, **params)
-            if d:
-                return d
+        for ex in ex_list:
+            p2 = dict(params)
+            if ex is not None:
+                p2["exchange"] = ex
+            for p in paths:
+                d = cg(p, interval=iv, **p2)
+                if d:
+                    return d
     return None
 
 
@@ -256,7 +264,7 @@ def fetch_cg_bundle():
 
     liq = cg_try([
         "/api/futures/liquidation/aggregated-history",
-    ], intervals=IVS, symbol=COIN, limit=12)
+    ], intervals=IVS, symbol=COIN, limit=12, exchange_list=CG_EXLIST)
     if liq:
         L = lambda x,*k: next((float(x[key]) for key in k if x.get(key) is not None), 0)
         longs = [L(x,"longLiquidationUsd","long_liquidation_usd","aggregated_long_liquidation_usd") for x in liq]
@@ -267,7 +275,7 @@ def fetch_cg_bundle():
 
     fv = cg_try([
         "/api/futures/aggregated-taker-buy-sell-volume/history",
-    ], intervals=IVS, symbol=COIN, limit=12)
+    ], intervals=IVS, symbol=COIN, limit=12, exchange_list=CG_EXLIST)
     if fv:
         vol = 0
         for x in fv:
@@ -277,7 +285,7 @@ def fetch_cg_bundle():
 
     sv = cg_try([
         "/api/spot/aggregated-taker-buy-sell-volume/history",
-    ], intervals=IVS, symbol=COIN, limit=12)
+    ], intervals=IVS, symbol=COIN, limit=12, exchange_list=CG_EXLIST)
     if sv:
         buys = sells = 0
         for x in sv:
@@ -289,7 +297,7 @@ def fetch_cg_bundle():
 
     gls = cg_try([
         "/api/futures/global-long-short-account-ratio/history",
-    ], intervals=IVS, symbol=COIN, limit=4, exchange="Binance")
+    ], intervals=IVS, exchanges=CG_EXCHANGES, symbol=COIN, limit=4)
     if gls:
         out["ls_global"] = float(gls[-1].get("longShortRatio")
                                  or gls[-1].get("global_account_long_short_ratio")
@@ -297,7 +305,7 @@ def fetch_cg_bundle():
 
     tls = cg_try([
         "/api/futures/top-long-short-position-ratio/history",
-    ], intervals=IVS, symbol=COIN, limit=4, exchange="Binance")
+    ], intervals=IVS, exchanges=CG_EXCHANGES, symbol=COIN, limit=4)
     if tls:
         out["ls_top"] = float(tls[-1].get("longShortRatio")
                               or tls[-1].get("top_position_long_short_ratio")
@@ -305,7 +313,7 @@ def fetch_cg_bundle():
 
     tk = cg_try([
         "/api/futures/aggregated-taker-buy-sell-volume/history",
-    ], intervals=IVS, symbol=COIN, limit=12)
+    ], intervals=IVS, symbol=COIN, limit=12, exchange_list=CG_EXLIST)
     if tk:
         deltas = []
         for x in tk:
@@ -846,7 +854,9 @@ def main():
     chain_alerts = []
     if ETHERSCAN_KEY and CONTRACTS:
         all_chain = state.setdefault("chains", {})
-        for chainid, contract in CONTRACTS:
+        for _ci, (chainid, contract) in enumerate(CONTRACTS):
+            if _ci > 0:
+                time.sleep(0.4)  # Etherscan 초당 제한(3/sec) 회피
             cst = all_chain.setdefault(contract, {})
             if not cst.get("pair"):
                 cst["pair"], cst["symbol"], chain_name = fetch_pair_for(contract)
