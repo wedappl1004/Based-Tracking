@@ -114,6 +114,26 @@ def main():
                         send(spike_study.run_spike_study())
                     except Exception as e:
                         send(f"분석 실패: {e}")
+                elif text in ("wallets", "/wallets", "지갑"):
+                    print("[명령] wallets → 지갑 요약")
+                    try:
+                        import json as _j
+                        st = _j.load(open("state.json"))
+                        ws = st.get("wallet_summary_cache", {})
+                        if not ws:
+                            send("👁 최근 집계된 관찰지갑 움직임 없음 (조용함)")
+                        else:
+                            lines = ["👁 관찰지갑 활동 요약 (누적)"]
+                            ranked = sorted(ws.items(), key=lambda x: -(x[1]["out"]+x[1]["in"]))
+                            for lbl, w in ranked[:12]:
+                                bits=[]
+                                if w["out_n"]: bits.append(f"발신 {w['out_n']}건 {w['out']:,.0f}")
+                                if w["in_n"]: bits.append(f"수신 {w['in_n']}건 {w['in']:,.0f}")
+                                bits.append(f"순 {w['in']-w['out']:+,.0f}")
+                                lines.append(f"· {lbl}: " + " / ".join(bits))
+                            send("\n".join(lines))
+                    except Exception as e:
+                        send(f"지갑 요약 실패: {e}")
                 elif text in ("score", "/score", "성적", "성적표"):
                     print("[명령] score → 성적표")
                     try:
@@ -158,7 +178,7 @@ def main():
                     except Exception as e:
                         send(f"학습 실패: {e}")
                 elif text:
-                    send("아는 명령:\nupdate — 종합 리포트\nspike — 0.32 고점 조작 분석\ntrain — 전체 히스토리 학습\npremove — 과거 급등/급락 전조 부검\nscore — 신호 성적표 (자동 채점)")
+                    send("아는 명령:\nupdate — 종합 리포트\nspike — 0.32 고점 조작 분석\ntrain — 전체 히스토리 학습\npremove — 과거 급등/급락 전조 부검\nscore — 신호 성적표 (자동 채점)\nwallets — 지갑 움직임 요약 (원할 때만)")
         except requests.exceptions.RequestException as e:
             print(f"[poll] 네트워크 문제, 10초 후 재시도: {e}")
             time.sleep(10)
