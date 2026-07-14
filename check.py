@@ -130,7 +130,7 @@ for _item in os.environ.get("WATCH_WALLETS", "").split(","):
     if _item.startswith("0x"):
         _a, _, _l = _item.partition("=")
         WATCHLIST[_a.strip().lower()] = _l.strip() or _a[:8]
-WATCH_MIN = 1_000   # 워치리스트 알림 최소 수량 (더스트 스팸 방지)
+WATCH_MIN = 25_000   # 워치리스트 알림 최소 수량 (더스트 스팸 방지)
 # True = 온체인 알림은 내 워치리스트 지갑만 (조용함)
 # False = 모든 지갑의 수상한 움직임도 알림 (매집/고래/쪼개기 등)
 WATCH_ONLY = True
@@ -450,18 +450,24 @@ def analyze_chain(txs, chain_state, pair_addr=""):
             rec["in_amt"] += amt
             rec["in_n"] += 1
 
-        # ── 관찰 지갑: 움직임 무조건 보고 ──
+        # ── 관찰 지갑: 즉시 알림은 DEX 매도만, 나머지는 시간별 요약으로 집계 ──
         if amt >= WATCH_MIN:
+            wsum = chain_state.setdefault("watch_summary", {})
             if f in WATCHLIST:
                 lbl = WATCHLIST[f]
                 if pair_addr and t == pair_addr:
                     alerts.append(f"🚨👁 관찰지갑 [{lbl}] DEX 매도: {amt:,.0f} — 최우선 확인")
                 elif looks_exchange(t):
-                    alerts.append(f"👁 관찰지갑 [{lbl}] 거래소 추정 입금: {amt:,.0f} (매도 준비 가능)")
+                    alerts.append(f"🚨👁 관찰지갑 [{lbl}] 거래소 입금: {amt:,.0f} (매도 준비 가능)")
                 else:
-                    alerts.append(f"👁 관찰지갑 [{lbl}] 발신: {amt:,.0f} → {short(t)}")
+                    w = wsum.setdefault(lbl, {"out": 0.0, "out_n": 0, "in": 0.0, "in_n": 0})
+                    w["out"] += amt
+                    w["out_n"] += 1
             if t in WATCHLIST:
-                alerts.append(f"👁 관찰지갑 [{WATCHLIST[t]}] 수신: +{amt:,.0f} ← {short(f)}")
+                lbl = WATCHLIST[t]
+                w = wsum.setdefault(lbl, {"out": 0.0, "out_n": 0, "in": 0.0, "in_n": 0})
+                w["in"] += amt
+                w["in_n"] += 1
 
         # ── 팀 클러스터 전염: 팀 지갑에서 물량 받으면 팀 취급 ──
         if f in team and amt > 0:
@@ -579,11 +585,33 @@ def analyze_chain(txs, chain_state, pair_addr=""):
     chain_state["vol_hist"] = vh[-48:]
     chain_state["neww_hist"] = nh[-48:]
 
-    # 메가 단일 이동 (지갑 무관)
-    for tx in txs:
-        if tx["amount"] >= MEGA_THRESHOLD and tx["to"] != pair_addr:
-            alerts.append(f"🐳 메가 이동: {tx['amount']:,.0f} "
-                          f"{short(tx['from'])} → {short(tx['to'])}")
+    # 메가 단일 이동 (지갑 무관) — 체인홉(같은 물량 연쇄 이동)은 경로 1건으로 병합
+    megas = [tx for tx in txs if tx["amount"] >= MEGA_THRESHOLD
+             and tx["to"] != pair_addr]
+    used = set()
+    for i, tx in enumerate(megas):
+        if i in used:
+            continue
+        path = [tx["from"], tx["to"]]
+        amt = tx["amount"]
+        # 이어지는 홉 찾기: 도착지가 다음 출발지 + 금액 유사(±1%)
+        changed = True
+        while changed:
+            changed = False
+            for j, nx in enumerate(megas):
+                if j in used or j == i:
+                    continue
+                if nx["from"] == path[-1] and abs(nx["amount"]-amt)/amt < 0.01:
+                    path.append(nx["to"])
+                    used.add(j)
+                    changed = True
+        used.add(i)
+        if len(path) > 2:
+            route = " → ".join(short(a) for a in path)
+            alerts.append(f"🐳 메가 이동(경유 {len(path)-1}홉): {amt:,.0f} {route}")
+        else:
+            alerts.append(f"🐳 메가 이동: {amt:,.0f} "
+                          f"{short(path[0])} → {short(path[1])}")
 
     # ── 팀 클러스터 총 매도 요약 ──
     if pair_inflow_team >= TEAM_SELL_MIN:
@@ -1206,6 +1234,36 @@ def main():
         for msg in chain_alerts:
             _db.log_alert(msg[:12], msg, cur_price)
         _db.grade_pending(cur_price)
+
+    # ── 관찰지갑 시간별 요약 (1시간마다 한 방) ──
+    try:
+        wsum_all = {}
+        for _c, _cst in all_chain.items():
+            for lbl, w in _cst.get("watch_summary", {}).items():
+                agg = wsum_all.setdefault(lbl, {"out":0.0,"out_n":0,"in":0.0,"in_n":0})
+                for k2 in ("out","out_n","in","in_n"):
+                    agg[k2] += w[k2]
+        if now0 - state.get("last_wallet_summary", 0) >= 3600:
+            if wsum_all:
+                lines = ["👁 관찰지갑 시간 요약 (지난 1시간)"]
+                # 순유출 큰 순으로 정렬
+                ranked = sorted(wsum_all.items(),
+                                key=lambda x: -(x[1]["out"] + x[1]["in"]))
+                for lbl, w in ranked[:12]:
+                    bits = []
+                    if w["out_n"]:
+                        bits.append(f"발신 {w['out_n']}건 {w['out']:,.0f}")
+                    if w["in_n"]:
+                        bits.append(f"수신 {w['in_n']}건 {w['in']:,.0f}")
+                    net = w["in"] - w["out"]
+                    bits.append(f"순 {net:+,.0f}")
+                    lines.append(f"· {lbl}: " + " / ".join(bits))
+                send("\n".join(lines))
+            state["last_wallet_summary"] = now0
+            for _c, _cst in all_chain.items():
+                _cst["watch_summary"] = {}
+    except Exception as _e:
+        print(f"[wsum] {_e}")
 
     for msg in sorted(chain_alerts, key=rank)[:10]:
         send(f"[BASED 온체인] {msg}")
